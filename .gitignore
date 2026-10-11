@@ -8,3 +8,5 @@ config.json
 # Virtual Environment (اگر بعداً ساختید)
 venv/
 .venv/
+# intermediate layout skeleton
+*.layout.docx

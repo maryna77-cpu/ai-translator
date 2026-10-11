@@ -92,5 +92,15 @@
     "enabled": true,
     "path": "translation_memory.sqlite"
   },
-  "glossary_file": "glossary.json"
+  "glossary_file": "glossary.json",
+  "layout": {
+    "figure_dpi": 240,
+    "cluster_tolerance": 6.0,
+    "figure_merge_tolerance": 26.0,
+    "parse_stream_table": true,
+    "delete_end_line_hyphen": true,
+    "rasterize_logos": true,
+    "latin_font": "Calibri",
+    "persian_font": "Calibri"
+  }
 }

@@ -6,6 +6,7 @@ import logging
 import os
 import random
 import re
+import shutil
 import time
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,14 @@ from docx.shared import Inches, Pt
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 
+from docx_layout import (
+    Unit,
+    apply_translation,
+    collect_units,
+    relax_table_rows,
+    restyle_residual_runs,
+)
+from pdf_layout import DEFAULT_FIGURE_SETTINGS, PageFigures, prepare_pdf_stream
 from providers import build_provider
 from translator import (
     QuotaExhaustedError,
@@ -222,6 +231,244 @@ def api_call(provider, batch, glossary, cfg, all_targets):
 
 
 
+# ---------------------------------------------------------------------------
+# Layout-preserving pipeline (default)
+# ---------------------------------------------------------------------------
+
+def cache_key(text: str) -> str:
+    """Normalisation used for the reusable translation cache."""
+    return re.sub(r"\s+", " ", text).strip().replace("¶", "'")
+
+
+DEFAULT_LAYOUT = {
+    **DEFAULT_FIGURE_SETTINGS,
+    "parse_stream_table": True,   # let pdf2docx rebuild aligned text as tables
+    "delete_end_line_hyphen": True,
+    "latin_font": "Calibri",      # font for Latin text/digits in the output
+    "persian_font": "Calibri",    # font used for Persian glyphs (w:cs); e.g. "B Nazanin"
+}
+
+
+def parse_page_range(spec: str | None, page_count: int) -> tuple[int, int] | None:
+    """Parse CLI ranges like ``1-10`` (1-based, inclusive) into pdf2docx bounds."""
+    if not spec:
+        return None
+    match = re.fullmatch(r"\s*(\d+)\s*(?:-\s*(\d+)\s*)?", spec)
+    if not match:
+        raise ValueError(f"Invalid page range: {spec!r} (expected e.g. 1-10)")
+    start = int(match.group(1)) - 1
+    end = int(match.group(2)) if match.group(2) else int(match.group(1))
+    if start < 0 or end < start + 1:
+        raise ValueError(f"Invalid page range: {spec!r}")
+    return (start, min(end, page_count))
+
+
+def build_layout_docx(input_path: Path, cfg: dict, target_path: Path,
+                      pages: tuple[int, int] | None = None) -> list[PageFigures]:
+    """Create the layout-faithful Word skeleton for ``input_path``.
+
+    PDF input is pre-processed (figures become raster images) and converted with
+    ``pdf2docx``; DOCX input is copied as-is so its own layout is preserved.
+    """
+    layout_cfg = {**DEFAULT_LAYOUT, **(cfg.get("layout") or {})}
+    suffix = input_path.suffix.lower()
+    if suffix == ".docx":
+        shutil.copyfile(input_path, target_path)
+        return []
+    if suffix != ".pdf":
+        raise ValueError("Supported input formats are PDF and DOCX.")
+
+    data, stats = prepare_pdf_stream(str(input_path), layout_cfg, page_range=pages)
+    figure_count = sum(len(s.regions) for s in stats)
+    log.info("Figures rasterized as images: %d region(s) on %d page(s).",
+             figure_count, sum(1 for s in stats if s.regions))
+
+    from pdf2docx import Converter  # imported late: optional heavy dependency
+    converter = Converter(stream=data)
+    try:
+        converter.convert(
+            str(target_path),
+            parse_stream_table=bool(layout_cfg.get("parse_stream_table", True)),
+            parse_lattice_table=True,
+            delete_end_line_hyphen=bool(layout_cfg.get("delete_end_line_hyphen", True)),
+        )
+    finally:
+        converter.close()
+    return stats
+
+
+def _unique_targets(units: list[Unit]) -> tuple[list[dict[str, Any]], dict[str, list[str]]]:
+    """Collapse duplicated texts (running headers, repeated notes) into one target."""
+    key_to_target: dict[str, dict[str, Any]] = {}
+    key_to_units: dict[str, list[str]] = {}
+    targets: list[dict[str, Any]] = []
+    for unit in units:
+        key = re.sub(r"\s+", " ", unit.text).strip()
+        if key not in key_to_target:
+            key_to_target[key] = {
+                "id": f"k{len(targets) + 1}",
+                "kind": unit.kind,
+                "location": unit.location,
+                "text": key,
+            }
+            key_to_units[key] = []
+            targets.append(key_to_target[key])
+        key_to_units[key].append(unit.id)
+    return targets, key_to_units
+
+
+def translate_document(input_path: Path, output_path: Path, cfg: dict, provider_name: str,
+                       resume: bool = False, provider=None, pages: tuple[int, int] | None = None):
+    """Translate a PDF/DOCX into a layout-faithful Persian Word document."""
+    layout_cfg = {**DEFAULT_LAYOUT, **(cfg.get("layout") or {})}
+    checkpoint_path = Path(str(output_path) + ".checkpoint.json")
+    layout_path = Path(str(output_path) + ".layout.docx")
+
+    build_layout_docx(input_path, cfg, layout_path, pages=pages)
+    doc = Document(str(layout_path))
+    units = collect_units(doc)
+    log.info("Layout skeleton ready: %d translatable paragraph(s)/cell(s).", len(units))
+    if not units:
+        layout_path.unlink(missing_ok=True)
+        raise RuntimeError("No selectable text found. If this is a scanned/image-only PDF, OCR is required and is not included in this version.")
+
+    targets, key_to_units = _unique_targets(units)
+    unit_key = {unit.id: re.sub(r"\s+", " ", unit.text).strip() for unit in units}
+
+    digest = hashlib.sha256(input_path.read_bytes()).hexdigest()
+    pages_spec = list(pages) if pages else None
+    old: dict[str, str] = {}
+    if checkpoint_path.exists():
+        state = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+        if state.get("version") != 3 or state.get("input_sha256") != digest or state.get("pages") != pages_spec:
+            raise RuntimeError("Checkpoint does not match this input/run (version, input or page range differs). Choose a new output path or remove the old checkpoint.")
+        if resume:
+            old = state.get("translations", {})
+
+    provider = provider if provider is not None else build_provider(cfg, provider_name)
+    glossary_path = Path(cfg.get("glossary_file", "glossary.json"))
+    if not glossary_path.is_absolute():
+        glossary_path = Path.cwd() / glossary_path
+    glossary = json.loads(glossary_path.read_text(encoding="utf-8")) if glossary_path.exists() else {}
+
+    settings = cfg.get("translation", {})
+    max_items = max(1, int(settings.get("document_batch_max_items", 10)))
+    max_chars = max(500, int(settings.get("document_batch_max_chars", 6000)))
+    translations = dict(old)
+
+    # Optional reusable translation cache ({source: translation} JSON): paragraphs
+    # translated in earlier runs/documents are not sent to the API again.
+    cache_file = settings.get("cache_file")
+    cache: dict[str, str] = {}
+    if cache_file:
+        cache_path = Path(cache_file)
+        if not cache_path.is_absolute():
+            cache_path = Path.cwd() / cache_path
+        if cache_path.exists():
+            cache = json.loads(cache_path.read_text(encoding="utf-8"))
+        hits = 0
+        for target in targets:
+            key = cache_key(target["text"])
+            translation = cache.get(key) or cache.get(key.replace(" ", ""))
+            if isinstance(translation, str) and translation.strip():
+                for uid in key_to_units[target["text"]]:
+                    translations.setdefault(uid, translation.strip())
+                hits += 1
+        if hits:
+            log.info("Translation cache supplied %d/%d unique paragraph(s).", hits, len(targets))
+
+    pending = [item for item in targets
+               if any(uid not in translations for uid in key_to_units[item["text"]])]
+    log.info("Already translated: %d/%d unique paragraph(s).", len(targets) - len(pending), len(targets))
+
+    def commit_state(status: str, current: list[str] | None = None, error: str | None = None):
+        state = {
+            "version": 3, "status": status, "input": str(input_path.resolve()),
+            "input_sha256": digest, "pages": pages_spec,
+            "output": str(output_path.resolve()),
+            "provider": provider_name,
+            "model": cfg.get("providers", {}).get(provider_name, {}).get("model"),
+            "completed_count": len(translations), "total_count": len(units),
+            "translations": translations, "current_batch": current, "last_error": error,
+        }
+        tmp = checkpoint_path.with_suffix(checkpoint_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, checkpoint_path)
+
+    commit_state("translating")
+    completed = len(targets) - len(pending)
+
+    def translate_batch_resilient(batch: list[dict[str, Any]]):
+        nonlocal completed
+        ids = [item["id"] for item in batch]
+        try:
+            result = api_call(provider, batch, glossary, cfg, targets)
+            for item in batch:
+                translation = result.get(item["id"])
+                if translation is None:
+                    continue
+                for uid in key_to_units[item["text"]]:
+                    translations[uid] = translation
+            completed += len(batch)
+            commit_state("translating")
+            log.info("Translated %d/%d unique paragraph(s).", completed, len(targets))
+        except (ValueError, json.JSONDecodeError) as exc:
+            if len(batch) <= 1:
+                raise
+            log.warning("Invalid model output for batch %s; splitting batch. Reason: %s", ids, exc)
+            mid = len(batch) // 2
+            translate_batch_resilient(batch[:mid])
+            translate_batch_resilient(batch[mid:])
+        except (QuotaExhaustedError, RetryExhaustedError) as exc:
+            commit_state("paused", ids, str(exc))
+            raise
+
+    index = 0
+    while index < len(pending):
+        batch: list[dict[str, Any]] = []
+        char_count = 0
+        while index < len(pending) and len(batch) < max_items:
+            item = pending[index]
+            if batch and char_count + len(item["text"]) > max_chars:
+                break
+            batch.append(item)
+            char_count += len(item["text"])
+            index += 1
+        translate_batch_resilient(batch)
+
+    if cache_file:
+        cache_path = Path(cache_file)
+        if not cache_path.is_absolute():
+            cache_path = Path.cwd() / cache_path
+        for target in targets:
+            translation = translations.get(key_to_units[target["text"]][0])
+            if translation:
+                cache.setdefault(cache_key(target["text"]), translation)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")
+
+    latin_font = str(layout_cfg.get("latin_font", "Calibri"))
+    persian_font = str(layout_cfg.get("persian_font", latin_font))
+    applied = 0
+    for unit in units:
+        translation = translations.get(unit.id)
+        if not translation:
+            continue
+        apply_translation(unit.paragraph, translation.strip().replace("¶", "'"), latin_font, persian_font)
+        applied += 1
+    restyle_residual_runs(doc, latin_font, persian_font)
+    relax_table_rows(doc)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    doc.save(str(output_path))
+    layout_path.unlink(missing_ok=True)
+    commit_state("completed")
+    log.info("Saved layout-preserving Word document: %s (%d paragraph(s) translated).", output_path, applied)
+
+
+# ---------------------------------------------------------------------------
+# Legacy plain-text pipeline (opt-in via --plain)
+# ---------------------------------------------------------------------------
 
 _PAGE_NUMBER_RE = re.compile(r"^(?:(?:page|p\.?|صفحه)\s*)?[-–—]?\s*\d{1,4}\s*(?:[-–—]|/\s*\d{1,4})?$", re.I)
 
@@ -365,7 +612,8 @@ def _make_clean_docx(translated_items: list[dict[str, Any]], output_path: Path) 
     doc.save(str(output_path))
 
 
-def translate_document(input_path: Path, output_path: Path, cfg: dict, provider_name: str, resume: bool = False):
+def translate_document_plain(input_path: Path, output_path: Path, cfg: dict, provider_name: str, resume: bool = False):
+    """Legacy behaviour: plain Word file with translated paragraphs only."""
     checkpoint_path = Path(str(output_path) + ".checkpoint.json")
     targets = extract_targets(input_path)
     log.info("Extracted %d text paragraphs. Output will be rebuilt as plain Word text.", len(targets))
@@ -444,4 +692,3 @@ def translate_document(input_path: Path, output_path: Path, cfg: dict, provider_
     _make_clean_docx(ordered, output_path)
     commit_state("completed")
     log.info("Saved plain Word document: %s", output_path)
-
