@@ -1,0 +1,96 @@
+{
+  "provider": "winkapi",
+  "providers": {
+    "winkapi": {
+      "type": "openai_compatible",
+      "base_url": "https://api.winkapi.net/v1",
+      "api_key_env": "WINKAPI_API_KEY",
+      "model": "gemini-3.8-flash-medium",
+      "timeout_seconds": 180,
+      "max_tokens_field": "max_tokens"
+    },
+    "openai": {
+      "type": "openai_compatible",
+      "base_url": "https://api.openai.com/v1",
+      "api_key_env": "OPENAI_API_KEY",
+      "model": "YOUR_MODEL",
+      "timeout_seconds": 180,
+      "max_tokens_field": "max_tokens"
+    },
+    "openrouter": {
+      "type": "openai_compatible",
+      "base_url": "https://openrouter.ai/api/v1",
+      "api_key_env": "OPENROUTER_API_KEY",
+      "model": "YOUR_PROVIDER_MODEL",
+      "timeout_seconds": 180,
+      "max_tokens_field": "max_tokens"
+    },
+    "ollama": {
+      "type": "ollama",
+      "base_url": "http://127.0.0.1:11434",
+      "model": "qwen3:8b",
+      "timeout_seconds": 600
+    },
+    "custom_http": {
+      "type": "http_json",
+      "url": "https://example.com/v1/generate",
+      "model": "YOUR_MODEL",
+      "timeout_seconds": 180,
+      "header_env": {
+        "Authorization": "MY_API_KEY"
+      },
+      "body_template": {
+        "model": "${model}",
+        "system": "${system_prompt}",
+        "prompt": "${user_prompt}",
+        "temperature": "${temperature}",
+        "max_tokens": "${max_output_tokens}"
+      },
+      "response_path": [
+        "text"
+      ]
+    },
+    "gemini": {
+      "type": "gemini",
+      "api_key_env": "GEMINI_API_KEY",
+      "model": "YOUR_GEMINI_MODEL",
+      "timeout_seconds": 180,
+      "structured_output": true
+    }
+  },
+  "translation": {
+    "target_language": "Persian",
+    "batch_max_items": 20,
+    "batch_max_chars": 12000,
+    "context_before": 3,
+    "context_after": 3,
+    "context_window_tokens": 16384,
+    "max_output_tokens": 5000,
+    "chars_per_token_estimate": 3.5,
+    "token_safety_factor": 1.25,
+    "temperature": 0.2,
+    "retry_count": 5,
+    "retry_base_seconds": 10,
+    "retry_max_seconds": 180,
+    "retry_jitter_seconds": 3,
+    "style": "Natural, technically precise Persian suitable for educational subtitles",
+    "glossary_max_terms_per_batch": 80,
+    "document_batch_max_items": 10,
+    "document_batch_max_chars": 6000,
+    "document_max_output_tokens": 6000,
+    "document_glossary_max_terms": 100,
+    "document_style": "Technically precise Persian for embedded systems, electronics, firmware, microcontrollers, programming, and engineering books. Preserve all technical details.",
+    "document_context_items": 2,
+    "document_skip_diagram_labels": true,
+    "document_clean_text_layout": true
+  },
+  "review": {
+    "enabled": false,
+    "retry_count": 1
+  },
+  "translation_memory": {
+    "enabled": true,
+    "path": "translation_memory.sqlite"
+  },
+  "glossary_file": "glossary.json"
+}

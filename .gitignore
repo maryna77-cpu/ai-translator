@@ -1,0 +1,10 @@
+# Cache
+__pycache__/
+*.pyc
+
+# Sensitive Configs (کلیدهای امنیتی شما)
+config.json
+
+# Virtual Environment (اگر بعداً ساختید)
+venv/
+.venv/
